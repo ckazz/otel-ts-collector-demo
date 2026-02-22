@@ -78,14 +78,14 @@ const TOOL_DEFS = [
 ];
 
 // ---------------------------------------------------------------------------
-// Single conversation turn (creates LLM → tool → LLM child spans)
+// Single conversation turn (creates invoke_agent → LLM → tool → LLM)
 // ---------------------------------------------------------------------------
 interface TurnResult {
   finalAnswer: string;
 }
 
-export async function runConversationTurn(
-  sessionCtx: ReturnType<typeof trace.setSpan>,
+async function runTurnSteps(
+  turnCtx: ReturnType<typeof trace.setSpan>,
   userMessage: string,
   turnNumber: number,
   useRealLLM: boolean,
@@ -93,7 +93,7 @@ export async function runConversationTurn(
   const mockLLM = await import("./mock-llm.js");
 
   // === LLM Call 1: decide what to do ===
-  const llm1Answer = await context.with(sessionCtx, () =>
+  const llm1Answer = await context.with(turnCtx, () =>
     tracer.startActiveSpan("chat", async (llmSpan: Span) => {
       try {
         // GenAI attributes — matched by Galileo's detector (GENAI_ATTRIBUTES set)
@@ -146,7 +146,7 @@ export async function runConversationTurn(
   // === Tool Call (if LLM decided to use one) ===
   let toolResult = "";
   if (llm1Answer.toolCall) {
-    toolResult = await context.with(sessionCtx, () =>
+    toolResult = await context.with(turnCtx, () =>
       tracer.startActiveSpan("execute_tool", async (toolSpan: Span) => {
         try {
           const { name: toolName, arguments: toolArgs } =
@@ -183,7 +183,7 @@ export async function runConversationTurn(
   }
 
   // === LLM Call 2: synthesize final answer from tool results ===
-  const finalResponse = await context.with(sessionCtx, () =>
+  const finalResponse = await context.with(turnCtx, () =>
     tracer.startActiveSpan("chat", async (llm2Span: Span) => {
       try {
         llm2Span.setAttribute("gen_ai.operation.name", "chat");
@@ -239,7 +239,52 @@ export async function runConversationTurn(
 }
 
 // ---------------------------------------------------------------------------
-// Full session: 2 conversation turns under one session root span
+// Single conversation turn as its own trace (root span = invoke_agent)
+// ---------------------------------------------------------------------------
+async function runConversationTurn(
+  sessionId: string,
+  userMessage: string,
+  turnNumber: number,
+  useRealLLM: boolean,
+): Promise<TurnResult> {
+  return tracer.startActiveSpan("invoke_agent", async (turnSpan: Span) => {
+    const turnCtx = trace.setSpan(context.active(), turnSpan);
+
+    try {
+      // invoke_agent → Galileo maps to GenAISpanType.AGENT (processor.py:41)
+      turnSpan.setAttribute("gen_ai.operation.name", "invoke_agent");
+      turnSpan.setAttribute("gen_ai.agent.name", "restaurant_assistant");
+
+      // session.id on every root span → Galileo groups them into one session
+      turnSpan.setAttribute("session.id", sessionId);
+
+      // Input/output on the root so Galileo shows them at trace level
+      turnSpan.addEvent("gen_ai.user.message", { content: userMessage });
+
+      const result = await runTurnSteps(
+        turnCtx,
+        userMessage,
+        turnNumber,
+        useRealLLM,
+      );
+
+      turnSpan.addEvent("gen_ai.choice", { message: result.finalAnswer });
+      turnSpan.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      turnSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: String(err),
+      });
+      throw err;
+    } finally {
+      turnSpan.end();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Full session: 2 turns as separate traces, grouped by session.id
 // ---------------------------------------------------------------------------
 export async function runSession(useRealLLM: boolean): Promise<void> {
   const sessionId = randomUUID();
@@ -249,47 +294,18 @@ export async function runSession(useRealLLM: boolean): Promise<void> {
   console.log(`Mode:    ${useRealLLM ? "Real OpenAI" : "Simulated"}`);
   console.log(`${"=".repeat(60)}\n`);
 
-  await tracer.startActiveSpan("agent_session", async (sessionSpan: Span) => {
-    const sessionCtx = trace.setSpan(context.active(), sessionSpan);
+  // --- Turn 1 (own trace) ---
+  const turn1Input = "Help me find a good restaurant nearby";
+  console.log(`[Turn 1] User: ${turn1Input}`);
 
-    try {
-      // session.id → extracted by Galileo at otel.py _extract_session_from_span_attributes
-      sessionSpan.setAttribute("session.id", sessionId);
+  const turn1 = await runConversationTurn(sessionId, turn1Input, 1, useRealLLM);
+  console.log(`[Turn 1] Assistant: ${turn1.finalAnswer}\n`);
 
-      // --- Turn 1 ---
-      const turn1Input = "Help me find a good restaurant nearby";
-      console.log(`[Turn 1] User: ${turn1Input}`);
+  // --- Turn 2 (own trace, same session.id) ---
+  const turn2Input =
+    "Can you check if they have availability tonight for 2 people?";
+  console.log(`[Turn 2] User: ${turn2Input}`);
 
-      const turn1 = await runConversationTurn(
-        sessionCtx,
-        turn1Input,
-        1,
-        useRealLLM,
-      );
-      console.log(`[Turn 1] Assistant: ${turn1.finalAnswer}\n`);
-
-      // --- Turn 2 ---
-      const turn2Input =
-        "Can you check if they have availability tonight for 2 people?";
-      console.log(`[Turn 2] User: ${turn2Input}`);
-
-      const turn2 = await runConversationTurn(
-        sessionCtx,
-        turn2Input,
-        2,
-        useRealLLM,
-      );
-      console.log(`[Turn 2] Assistant: ${turn2.finalAnswer}\n`);
-
-      sessionSpan.setStatus({ code: SpanStatusCode.OK });
-    } catch (err) {
-      sessionSpan.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: String(err),
-      });
-      throw err;
-    } finally {
-      sessionSpan.end();
-    }
-  });
+  const turn2 = await runConversationTurn(sessionId, turn2Input, 2, useRealLLM);
+  console.log(`[Turn 2] Assistant: ${turn2.finalAnswer}\n`);
 }

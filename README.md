@@ -32,31 +32,32 @@ The app sends **no Galileo-specific headers** — the collector owns the export 
 
 ## Span Hierarchy
 
-Each session creates the following span tree:
+Each conversation turn is its own OTEL trace. Galileo groups them into a
+single session because they share the same `session.id` attribute.
 
 ```
-agent_session (session.id=<uuid>)
+Session (Galileo groups traces by session.id)
 │
-├── Turn 1 ────────────────────────────────────────────
-│   ├── chat             (LLM: decides to use web_search)
-│   ├── execute_tool     (web_search: returns restaurant list)
-│   └── chat             (LLM: synthesizes recommendation)
+├── Trace 1 ── invoke_agent "restaurant_assistant"
+│              ├── chat             (LLM: decides to use web_search)
+│              ├── execute_tool     (web_search: returns restaurant list)
+│              └── chat             (LLM: synthesizes recommendation)
 │
-└── Turn 2 ────────────────────────────────────────────
-    ├── chat             (LLM: decides to check availability)
-    ├── execute_tool     (check_availability: returns time slots)
-    └── chat             (LLM: presents reservation options)
+└── Trace 2 ── invoke_agent "restaurant_assistant"
+               ├── chat             (LLM: decides to check availability)
+               ├── execute_tool     (check_availability: returns time slots)
+               └── chat             (LLM: presents reservation options)
 ```
 
 ## GenAI Attributes
 
 | Span Type | Key Attributes |
 |-----------|---------------|
-| Session root | `session.id` |
+| Agent root (`invoke_agent`) | `session.id`, `gen_ai.operation.name`, `gen_ai.agent.name` |
 | LLM (`chat`) | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.provider.name`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons` |
 | Tool (`execute_tool`) | `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` |
 
-LLM spans also carry input/output via OTEL events: `gen_ai.user.message` and `gen_ai.choice`.
+Agent and LLM spans carry input/output via OTEL events: `gen_ai.user.message` and `gen_ai.choice`.
 
 ## Prerequisites
 
@@ -154,17 +155,15 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:16686
 
 1. Open http://localhost:16686 in your browser
 2. In the **Service** dropdown, select **otel-ts-collector-demo**
-3. Click **Find Traces** — you should see one trace
-4. Click on the trace to expand the span tree:
-   - `agent_session` — root span (carries `session.id`)
-     - `chat` — LLM call 1 (Turn 1: decides to search)
-     - `execute_tool` — tool call (web_search)
-     - `chat` — LLM call 2 (Turn 1: recommendation)
-     - `chat` — LLM call 3 (Turn 2: decides to check availability)
-     - `execute_tool` — tool call (check_availability)
-     - `chat` — LLM call 4 (Turn 2: reservation options)
+3. Click **Find Traces** — you should see two traces (one per conversation turn)
+4. Click on a trace to expand the span tree:
+   - `invoke_agent` — root span (carries `session.id` and agent name)
+     - `chat` — LLM call (decides which tool to use)
+     - `execute_tool` — tool call (web_search or check_availability)
+     - `chat` — LLM call (synthesizes final answer)
 5. Click any span to inspect its **Tags** (attributes) and **Logs** (events):
-   - LLM spans show `gen_ai.request.model`, token counts, and `gen_ai.choice` events with the response text
+   - Agent spans show `gen_ai.agent.name` and input/output events
+   - LLM spans show `gen_ai.request.model`, token counts, and `gen_ai.choice` events
    - Tool spans show `gen_ai.tool.name`, arguments, and result
 
 ### In Galileo
